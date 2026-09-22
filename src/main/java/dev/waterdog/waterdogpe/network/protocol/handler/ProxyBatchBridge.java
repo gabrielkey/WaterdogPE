@@ -58,9 +58,7 @@ public class ProxyBatchBridge implements BedrockPacketHandler {
         ListIterator<BedrockPacketWrapper> iterator = batch.getPackets().listIterator();
         while (iterator.hasNext()) {
             BedrockPacketWrapper wrapper = iterator.next();
-            if (wrapper.getPacket() == null) {
-                this.decodePacket(wrapper, source.getPacketDirection());
-            }
+            boolean decoded = wrapper.getPacket() != null || this.decodePacket(wrapper, source.getPacketDirection());
 
             if (TRACE_PACKETS) {
                 BedrockPacket packet = wrapper.getPacket();
@@ -68,6 +66,10 @@ public class ProxyBatchBridge implements BedrockPacketHandler {
                 boolean fromClient = source.getPacketDirection().getInbound() == PacketRecipient.SERVER;
                 log.info("[{} {}] {}", fromClient ? "client ->" : "server ->", source.getSocketAddress(),
                         packet == null ? "id " + wrapper.getPacketId() : packet.getPacketType());
+            }
+
+            if (!decoded) {
+                continue; // relayed as the bytes it arrived as, see decodePacket
             }
 
             PacketSignal signal = this.handlePacket(wrapper.getPacket());
@@ -101,14 +103,28 @@ public class ProxyBatchBridge implements BedrockPacketHandler {
         }
     }
 
-    private void decodePacket(BedrockPacketWrapper wrapper, PacketDirection direction) {
+    /**
+     * Decodes a packet so the proxy can read and rewrite it.
+     * <p>
+     * A packet the codec build cannot make sense of is no reason to drop the player. Downstream
+     * gains payload fields between game versions and the codec catches up afterwards; until it
+     * does, the decode throws, and killing the connection over it turns a single unknown event
+     * into "Internal error" for whoever triggered it. Nothing has touched the buffer at that
+     * point, so the packet still relays exactly as it arrived - it only misses the rewriting the
+     * proxy would have done, and a packet the proxy cannot read is one it has nothing to rewrite.
+     *
+     * @return true when the packet was decoded, false when it has to be relayed untouched
+     */
+    private boolean decodePacket(BedrockPacketWrapper wrapper, PacketDirection direction) {
         ByteBuf msg = wrapper.getPacketBuffer().retainedSlice();
         try {
             msg.skipBytes(wrapper.getHeaderLength()); // skip header
             wrapper.setPacket(this.codec.tryDecode(helper, msg, wrapper.getPacketId(), direction.getInbound()));
+            return true;
         } catch (Throwable t) {
-            log.warn("Failed to decode packet", t);
-            throw t;
+            log.warn("Failed to decode packet id {}, relaying it untouched: {}", wrapper.getPacketId(), t.getMessage());
+            log.debug("Packet id {} failed to decode", wrapper.getPacketId(), t);
+            return false;
         } finally {
             msg.release();
         }
